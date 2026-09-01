@@ -1,0 +1,358 @@
+---
+title: "6. ELISA validation panels (Figure 4)"
+format:
+  html:
+    df-print: paged
+    embed-resources: true
+    toc: true
+  gfm: default
+---
+
+## Purpose
+
+This script builds the ELISA validation panels for the four biomarkers, LGALS9, CCL13, DAPP1, and SKAP2. It compares cases against controls, compares clinical event subtypes, compares against death, and correlates each biomarker with its Olink NPX value. It produces Fig. 4 (all measurements) and Fig. S4 (sensitivity analysis with Tukey outliers excluded).
+
+## Reproducibility
+
+This script runs entirely from the public repository. Only `elisa_validation.tsv`, `olink_proteomics_npx.csv`, and `metadata.tsv` are needed.
+
+```{r}
+#| message: false
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+```
+
+```{r}
+BASE_FONT    <- 8    # legible at the 21x14.85cm final print size (iterated by rendering)
+TITLE_SIZE   <- BASE_FONT * 0.85
+BRACKET_SIZE <- BASE_FONT * 0.28
+POINT_SIZE   <- 0.7
+
+# Colour-blind-friendly palette (Okabe & Ito 2008)
+CB_COLORS <- c(
+    Control                = "#0072B2",  # blue
+    Cases                  = "#D55E00",  # vermillion
+    Cancer                 = "#E69F00",  # orange
+    Cardiovascular         = "#009E73",  # bluish green
+    `Death (all-cause)`    = "#CC79A7"   # reddish purple
+)
+```
+
+```{r}
+format_p <- function(p, digits = 4) {
+    threshold <- 10^(-digits)
+    ifelse(p < threshold, sprintf("<%s", format(threshold, scientific = FALSE)),
+           sprintf("%.4f", p))
+}
+```
+
+## Load data
+
+```{r}
+#| message: false
+elisa <- read_tsv("../data/elisa_validation.tsv")
+olink <- read_csv("../data/olink_proteomics_npx.csv")
+metadata <- read_tsv("../data/metadata.tsv") |>
+    mutate(group = if_else(group == "Event", 1, 0))
+```
+
+One row per protein x sample (unique per sample -- no group expansion, so no double-counting anywhere downstream).
+
+```{r}
+protein_long <- bind_rows(lapply(c("DAPP1", "CCL13", "SKAP2", "LGALS9"), function(p) {
+    conc <- elisa |> filter(assay == p) |> dplyr::select(sid, conc = mean_conc)
+    npx  <- olink |> filter(Assay == p) |> dplyr::select(sid = SampleID, npx = NPX)
+    
+    conc |>
+        inner_join(npx, by = "sid") |>
+        inner_join(metadata |> dplyr::select(sid, group, nadm, mace, death_all), by = "sid") |>
+        mutate(protein = p) |>
+        filter(!is.na(conc))
+}))
+protein_dfs <- split(protein_long, protein_long$protein)
+```
+
+```{r}
+flag_iqr <- function(x) {
+    q <- quantile(x, c(0.25, 0.75), na.rm = TRUE); iqr <- diff(q)
+    x < (q[1] - 1.5 * iqr) | x > (q[2] + 1.5 * iqr)
+}
+
+# Outlier-excluded, deduplicated per-sample datasets -- one exclusion rule per
+# protein applied once, not per comparison (the panel comparisons below share
+# overlapping membership by design). Same Tukey 1.5xIQR rule for all 4
+# proteins -- no protein-specific exception.
+scatter_dfs <- protein_dfs
+scatter_dfs_clean <- lapply(protein_dfs, function(d) d %>% filter(!flag_iqr(conc)))
+```
+
+## ELISA vs. NPX correlation, all 4 proteins
+
+```{r}
+cor_tab <- bind_rows(lapply(names(protein_dfs), function(p) {
+    d <- protein_dfs[[p]]
+    ct <- cor.test(d$conc, d$npx, method = "spearman")
+    tibble(protein = p, n = nrow(d), spearman_rho = unname(ct$estimate), p_value = ct$p.value)
+}))
+cor_tab
+```
+
+## Column definitions
+
+```{r}
+# Column 1: Cases (cancer, cardiovascular event, or non-accidental death) vs. Control.
+make_cases_df <- function(df) {
+    df %>% filter(group %in% c(0, 1)) %>%
+        mutate(clinical_group = factor(ifelse(group == 0, "Control", "Cases"),
+                                       levels = c("Control", "Cases")))
+}
+
+# Column 2: Cancer vs. Cardiovascular vs. Control -- a genuine 3-way partition.
+make_component_df <- function(df) {
+    df %>%
+        mutate(clinical_group = case_when(
+            group == 0             ~ "Control",
+            nadm == 1 & mace == 0  ~ "Cancer",
+            mace == 1 & nadm == 0  ~ "Cardiovascular",
+            TRUE                   ~ NA_character_
+        )) %>%
+        filter(!is.na(clinical_group)) %>%
+        mutate(clinical_group = factor(clinical_group,
+                                       levels = c("Control", "Cancer", "Cardiovascular")))
+}
+
+# Column 3: Death (all-cause) vs. Control.
+make_death_df <- function(df) {
+    df %>% filter(group == 0 | death_all == 1) %>%
+        mutate(clinical_group = factor(ifelse(group == 0, "Control", "Death (all-cause)"),
+                                       levels = c("Control", "Death (all-cause)")))
+}
+
+comparison_builders <- list(
+    Cases     = make_cases_df,
+    Component = make_component_df,
+    Death     = make_death_df
+)
+comparison_headers <- c(
+    Cases     = "Cases vs. Control",
+    Component = "Cancer vs. Cardiovascular vs. Control",
+    Death     = "Death (all-cause) vs. Control",
+    Scatter   = "ELISA vs. Olink NPX"
+)
+```
+
+## Panel figures
+
+```{r}
+make_two_group_violin <- function(df2, protein_label, unit, comp_key, show_header) {
+    event_label <- setdiff(levels(df2$clinical_group), "Control")
+    a <- df2 %>% filter(clinical_group == "Control")   %>% pull(conc)
+    b <- df2 %>% filter(clinical_group == event_label)  %>% pull(conc)
+    pw <- if (length(a) > 0 && length(b) > 0) wilcox.test(a, b) else list(p.value = NA_real_)
+    sig <- !is.na(pw$p.value) && pw$p.value < 0.05
+    top_expand <- if (sig) 0.32 else 0.12
+    
+    title_txt <- if (show_header) {
+        sprintf("%s\nP=%s", comparison_headers[[comp_key]], format_p(pw$p.value))
+    } else {
+        sprintf("P=%s", format_p(pw$p.value))
+    }
+    p <- ggplot(df2, aes(x = clinical_group, y = conc, fill = clinical_group)) +
+        geom_violin(alpha = 0.6, trim = FALSE, linewidth = 0.25) +
+        geom_jitter(width = 0.08, alpha = 0.5, size = POINT_SIZE) +
+        scale_y_log10(expand = expansion(mult = c(0.05, top_expand))) +
+        scale_fill_manual(values = CB_COLORS) +
+        labs(title = title_txt, x = NULL, y = sprintf("%s (%s, log10)", protein_label, unit)) +
+        theme_minimal(base_size = BASE_FONT) +
+        theme(legend.position = "none", axis.text.x = element_text(angle = 20, hjust = 1),
+              plot.title = element_text(size = TITLE_SIZE))
+    
+    if (sig) {
+        p <- p + stat_compare_means(comparisons = list(c("Control", event_label)), method = "wilcox.test",
+                                    label = "p.format", tip.length = 0.01, size = BRACKET_SIZE)
+    }
+    p
+}
+
+make_three_group_violin <- function(df3, protein_label, unit, show_header) {
+    kw <- kruskal.test(conc ~ clinical_group, data = df3)
+    levs <- levels(droplevels(df3$clinical_group))
+    pairs <- combn(levs, 2, simplify = FALSE)
+    pvals <- vapply(pairs, function(pr) {
+        a <- df3$conc[df3$clinical_group == pr[1]]
+        b <- df3$conc[df3$clinical_group == pr[2]]
+        if (length(a) > 1 && length(b) > 1) wilcox.test(a, b)$p.value else NA_real_
+    }, numeric(1))
+    sig_pairs <- pairs[!is.na(pvals) & pvals < 0.05]
+    # Narrowest-span comparison first (drawn lowest), widest last (drawn
+    # highest) -- with only 2-3 possible pairs from 3 groups this keeps stacked
+    # brackets/labels from overlapping (ggpubr stacks in list order).
+    sig_pairs <- sig_pairs[order(vapply(sig_pairs, function(pr) diff(match(pr, levs)), numeric(1)))]
+    top_expand <- 0.12 + 0.28 * length(sig_pairs)
+    
+    title_txt <- if (show_header) {
+        sprintf("%s\nP=%s", comparison_headers[["Component"]], format_p(kw$p.value))
+    } else {
+        sprintf("P=%s", format_p(kw$p.value))
+    }
+    
+    p <- ggplot(df3, aes(x = clinical_group, y = conc, fill = clinical_group)) +
+        geom_violin(alpha = 0.6, trim = FALSE, linewidth = 0.25) +
+        geom_jitter(width = 0.08, alpha = 0.5, size = POINT_SIZE) +
+        scale_y_log10(expand = expansion(mult = c(0.05, top_expand))) +
+        scale_fill_manual(values = CB_COLORS) +
+        labs(title = title_txt, x = NULL, y = sprintf("%s (%s, log10)", protein_label, unit)) +
+        theme_minimal(base_size = BASE_FONT) +
+        theme(legend.position = "none", axis.text.x = element_text(angle = 20, hjust = 1),
+              plot.title = element_text(size = TITLE_SIZE))
+    
+    if (length(sig_pairs) > 0) {
+        p <- p + stat_compare_means(comparisons = sig_pairs, method = "wilcox.test",
+                                    label = "p.format", tip.length = 0.01, size = BRACKET_SIZE,
+                                    step.increase = 0.18)
+    }
+    p
+}
+
+make_scatter <- function(df, protein_label, show_header) {
+    ct <- cor.test(df$conc, df$npx, method = "spearman")
+    title_txt <- if (show_header) {
+        sprintf("%s\nrho=%.3f, P=%s", comparison_headers[["Scatter"]], ct$estimate, format_p(ct$p.value))
+    } else {
+        sprintf("rho=%.3f, P=%s", ct$estimate, format_p(ct$p.value))
+    }
+    ggplot(df, aes(x = npx, y = conc)) +
+        geom_point(size = POINT_SIZE, alpha = 0.6) +
+        labs(title = title_txt, x = "NPX", y = "Concentration") +
+        theme_minimal(base_size = BASE_FONT) +
+        theme(plot.title = element_text(size = TITLE_SIZE))
+}
+```
+
+## Build figure
+
+```{r}
+unit_map <- c(SKAP2 = "ng/ml", DAPP1 = "ng/ml", LGALS9 = "pg/ml", CCL13 = "pg/ml")
+panel_order <- c("SKAP2", "DAPP1", "LGALS9", "CCL13")  # published panel order A-D
+
+# One row of 4 panels (Cases, Cancer-vs-Cardio-vs-Control, Death, scatter) per
+# protein. Column headers appear once, on the first protein's row only.
+build_row <- function(protein_label, base_df, scatter_df, show_header) {
+    cases_df     <- comparison_builders$Cases(base_df)
+    component_df <- comparison_builders$Component(base_df)
+    death_df     <- comparison_builders$Death(base_df)
+    list(
+        make_two_group_violin(cases_df, protein_label, unit_map[[protein_label]], "Cases", show_header),
+        make_three_group_violin(component_df, protein_label, unit_map[[protein_label]], show_header),
+        make_two_group_violin(death_df, protein_label, unit_map[[protein_label]], "Death", show_header),
+        make_scatter(scatter_df, protein_label, show_header)
+    )
+}
+```
+
+```{r}
+figures <- list()
+for (version in c("with_outliers", "no_outliers")) {
+    dfs <- if (version == "with_outliers") scatter_dfs else scatter_dfs_clean
+    panels <- unlist(lapply(seq_along(panel_order), function(i) {
+        p <- panel_order[i]
+        build_row(p, dfs[[p]], dfs[[p]], show_header = (i == 1))
+    }), recursive = FALSE)
+    fig <- wrap_plots(panels, ncol = 4)
+    figures[[version]] <- fig
+}
+```
+
+Fig. 4 (all measurements, no exclusions):
+
+```{r}
+figures$with_outliers
+# Exported at half a DIN-A4 sheet (21 x 14.85cm) -- no further scaling
+# should be applied when placing these files in a document.
+# ggsave("../results/fig4_with_outliers.svg", plot = figures$with_outliers, width = 21, height = 14.85, units = "cm")
+# ggsave("../results/fig4_with_outliers.pdf", plot = figures$with_outliers, width = 21, height = 14.85, units = "cm")
+```
+
+Fig. S4 (sensitivity analysis, Tukey outliers excluded):
+
+```{r}
+figures$no_outliers
+# Exported at half a DIN-A4 sheet (21 x 14.85cm) -- no further scaling
+# should be applied when placing these files in a document.
+# ggsave("../results/figS4_no_outliers.svg", plot = figures$no_outliers, width = 21, height = 14.85, units = "cm")
+# ggsave("../results/figS4_no_outliers.pdf", plot = figures$no_outliers, width = 21, height = 14.85, units = "cm")
+```
+
+## Full comparison table, all 4 proteins, with/without outliers
+
+Raw/unadjusted Mann-Whitney p-values throughout (matching what is drawn on the figure panels) -- not corrected for multiple comparisons.
+
+```{r}
+run_two_group <- function(base_df, comp_key) {
+    df2 <- comparison_builders[[comp_key]](base_df)
+    event_label <- setdiff(levels(df2$clinical_group), "Control")
+    a <- df2 %>% filter(clinical_group == "Control")  %>% pull(conc)
+    b <- df2 %>% filter(clinical_group == event_label) %>% pull(conc)
+    tibble(comparison = paste(event_label, "vs Control"),
+           n_control = length(a), n_event = length(b),
+           test = "Mann-Whitney", p_value = wilcox.test(a, b)$p.value)
+}
+
+run_component <- function(base_df) {
+    df3 <- comparison_builders$Component(base_df)
+    kw <- kruskal.test(conc ~ clinical_group, data = df3)
+    n_by_group <- table(df3$clinical_group)
+    omnibus <- tibble(comparison = "Cancer vs Cardiovascular vs Control (omnibus)",
+                      n_control = n_by_group[["Control"]], n_event = NA_integer_,
+                      test = "Kruskal-Wallis", p_value = kw$p.value)
+    levs <- levels(droplevels(df3$clinical_group))
+    pairwise <- bind_rows(lapply(combn(levs, 2, simplify = FALSE), function(pr) {
+        a <- df3$conc[df3$clinical_group == pr[1]]
+        b <- df3$conc[df3$clinical_group == pr[2]]
+        tibble(comparison = paste(pr[2], "vs", pr[1]),
+               n_control = length(a), n_event = length(b),
+               test = "Mann-Whitney", p_value = wilcox.test(a, b)$p.value)
+    }))
+    bind_rows(omnibus, pairwise)
+}
+
+run_all <- function(base_df) {
+    bind_rows(
+        run_two_group(base_df, "Cases"),
+        run_component(base_df),
+        run_two_group(base_df, "Death")
+    )
+}
+
+pairwise_tab <- bind_rows(lapply(panel_order, function(p) {
+    bind_rows(
+        run_all(scatter_dfs[[p]])       %>% mutate(protein = p, outliers = "included"),
+        run_all(scatter_dfs_clean[[p]]) %>% mutate(protein = p, outliers = "excluded")
+    )
+})) %>% dplyr::select(protein, outliers, comparison, test, n_control, n_event, p_value)
+
+pairwise_tab
+```
+
+```{r}
+pairwise_wide <- pairwise_tab %>%
+    mutate(cell = sprintf("%s%s", ifelse(p_value < 0.05, "**", ""), format_p(p_value))) %>%  dplyr::select(protein, outliers, comparison, cell) %>%
+    pivot_wider(names_from = comparison, values_from = cell) %>%
+    arrange(protein, outliers)
+pairwise_wide
+```
+
+```{r}
+n_sig <- sum(pairwise_tab$p_value < 0.05)
+sprintf("Significant (p<0.05) tests: %d / %d", n_sig, nrow(pairwise_tab))
+```
+
+## Session info
+
+```{r}
+sessioninfo::session_info()
+```

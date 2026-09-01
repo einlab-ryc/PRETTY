@@ -1,0 +1,177 @@
+---
+title: "3. Table 1"
+format:
+  html:
+    df-print: paged
+    embed-resources: true
+    toc: true
+  gfm: default
+---
+
+## Purpose
+
+This script builds Table 1 using gtsummary. Participant characteristics are stratified by case/control status, for the full cohort and for three subgroups (the Olink analytic set, the RNA-seq analytic set, and participants excluded after Olink QC).
+
+## Reproducibility
+
+This script runs directly from the public `metadata.tsv`. Four variables with elevated re-identification risk are present in `metadata.tsv` as `NA` placeholder columns: `age`, `mode` (HIV acquisition risk factor), `paisorigen` (country of origin), and `artini_period` (year of ART initiation). The table structure, sample sizes, and every other statistic reproduce exactly, but these four columns display as entirely missing when run from the public repository, unlike the published Table 1, which used the corresponding values from the restricted CoRIS extract.
+
+```{r}
+#| message: false
+library(gtsummary)
+library(tidyverse)
+```
+
+## Helper functions
+
+The four tables below (full cohort, Olink subset, RNA-seq subset, Olink-excluded subset) differ only in *which participants* are included.
+
+```{r}
+# Reads metadata.tsv and optionally restricts to a set of `sid`s.
+prepare_table1_data <- function(filter_expr = TRUE) {
+    mdata <- read_tsv("../data/metadata.tsv") |>
+        mutate(across(c(olink_included, rnaseq_included), as.logical)) |> 
+        filter({{ filter_expr }})
+    
+    mdata |>
+        select(group, nadm, mace, death_all,
+               age, sex, mode, paisorigen, edulvl,
+               smoke, hta, art_reg, cvmax, nadircd4,
+               CD4_0, CD8_0, CD4CD8_0, CD4_24m, CD8_24m, CD4CD8_24,
+               months_art_sampling, artini_period) |>
+        mutate(across(
+            c(group, nadm, mace, death_all, sex,
+              edulvl, smoke, hta, art_reg),
+            as.factor
+        ))
+}
+```
+
+```{r}
+# Builds the gtsummary Table 1 from a prepared dataset (output of
+# prepare_table1_data()).
+build_gtsummary_table1 <- function(mdata) {
+    n_group <- table(mdata$group)
+    n_display <- setNames(sprintf("%d (%.1f%%)", n_group, 100 * prop.table(n_group)), names(n_group))
+    
+    mdata |>
+        tbl_summary(
+            by = group,
+            label = list(
+                nadm ~ "Non-AIDS defining malignancy",
+                mace ~ "Major cardiovascular events",
+                death_all ~ "Non-accidental death",
+                age ~ "Age",
+                sex ~ "Sex at birth",
+                mode ~ "Risk factor for HIV acquisition",
+                paisorigen ~ "Country of origin",
+                edulvl ~ "Education attainment",
+                smoke ~ "Smoker",
+                hta ~ "Hypertension",
+                art_reg ~ "ART class",
+                cvmax ~ "Maximum viral load (copies/mL)",
+                nadircd4 ~ "CD4 nadir (cells/µL)",
+                CD4_0 ~ "CD4 counts at ART initiation (cells/µL)",
+                CD8_0 ~ "CD8 counts at ART initiation (cells/µL)",
+                CD4CD8_0 ~ "CD4/CD8 ratio at ART initiation",
+                CD4_24m ~ "CD4 counts at Year 2 of ART (cells/µL)",
+                CD8_24m ~ "CD8 counts at Year 2 of ART (cells/µL)",
+                CD4CD8_24 ~ "CD4/CD8 ratio at Year 2 of ART",
+                months_art_sampling ~ "Months from ART initiation to sampling",
+                artini_period ~ "Year of ART initiation"
+            ),
+            statistic = all_continuous() ~ "{mean} ({sd})",
+            digits = list(
+                c(all_continuous(), -cvmax) ~ 1,
+                cvmax ~ 0,
+                all_categorical() ~ c(0, 1)
+            ),
+            sort = list(
+                all_categorical() ~ "frequency",
+                edulvl ~ "alphanumeric",
+                artini_period ~ "alphanumeric"
+            ),
+            missing = "no",
+            percent = mdata,
+            type = list(
+                age ~ "continuous",
+                mode ~ "continuous",
+                paisorigen ~ "continuous",
+                artini_period ~ "continuous"
+            )
+        ) |>
+        add_overall(last = TRUE, col_label = "**Total**") |>
+        add_p(
+            test = list(
+                all_continuous() ~ "t.test",
+                all_categorical() ~ "fisher.test"),
+            pvalue_fun = label_style_pvalue(digits = 3),
+            include = -c(age, mode, paisorigen, artini_period)
+        ) |>
+        modify_header(
+            all_stat_cols(stat_0 = FALSE) ~ "**{level}**"
+        ) |>
+        modify_table_body(
+            ~ add_row(
+                .x,
+                variable = "N",
+                row_type = "label",
+                label = "N",
+                stat_1 = n_display["Event"],
+                stat_2 = n_display["Control"],
+                stat_0 = sprintf("%d (100.0%%)", sum(n_group)),
+                .before = 1
+            )
+        )
+}
+```
+
+## Table 1 (full cohort)
+
+```{r}
+table_gts <- prepare_table1_data() |> build_gtsummary_table1()
+table_gts
+```
+
+```{r}
+# write_tsv(table_gts |> as_tibble(), "../results/table1.tsv", na = "")
+```
+
+## Table 1 for Olink
+
+```{r}
+table_gts_olink <- prepare_table1_data(olink_included) |> build_gtsummary_table1()
+table_gts_olink
+```
+
+```{r}
+# write_tsv(table_gts_olink |> as_tibble(), "../results/tableS1_olink.tsv", na = "")
+```
+
+## Table 1 for RNA-seq
+
+```{r}
+table_gts_rnaseq <- prepare_table1_data(rnaseq_included) |> build_gtsummary_table1()
+table_gts_rnaseq
+```
+
+```{r}
+# write_tsv(table_gts_rnaseq |> as_tibble(), "../results/tableS6_rnaseq.tsv", na = "")
+```
+
+## Table 1 for excluded participants in Olink after QC
+
+```{r}
+table_gts_olink_excluded <- prepare_table1_data(!olink_included) |> build_gtsummary_table1()
+table_gts_olink_excluded
+```
+
+```{r}
+# write_tsv(table_gts_olink_excluded |> as_tibble(), "../results/tableS15_olink_excluded.tsv", na = "")
+```
+
+## Session info
+
+```{r}
+sessioninfo::session_info()
+```

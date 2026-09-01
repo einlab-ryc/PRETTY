@@ -1,0 +1,277 @@
+---
+title: "9. Correlation analysis"
+format:
+  html:
+    df-print: paged
+    embed-resources: true
+    toc: true
+  gfm: default
+---
+
+## Purpose
+
+This script computes cross-omic correlations between differentially expressed proteins and genes, restricted to the SNAE comparison (Fig. 3A) and expanded to any outcome (Fig. 3B). It also correlates LGALS9 plasma NPX with HAVCR2 transcript expression (Fig. S10).
+
+## Reproducibility
+
+This script runs entirely from the public repository, using `olink_npx_qced_sid.tsv`, `rnaseq_transcriptomics_vst.tsv`, and the `dep_*.tsv` files.
+
+```{r}
+#| message: false
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+library(OlinkAnalyze)
+library(tidyverse)
+```
+
+Import proteomics data:
+
+```{r}
+#| message: false
+pdata <- read_tsv("../data/olink_npx_qced_sid.tsv")
+```
+
+Import metadata:
+
+```{r}
+#| message: false
+mdata <- pdata |>
+  dplyr::select(sid:death_all) |>
+  distinct() |>
+  arrange(sid)
+```
+
+Read differentially expressed proteins:
+
+```{r}
+#| message: false
+dep_group <- read_tsv("../results/tableS2_dep_group.tsv") |>
+  filter(Threshold == "Significant") |> pull(Assay)
+dep_nadm <- read_tsv("../results/tableS3_dep_nadm.tsv") |>
+  filter(Threshold == "Significant") |> pull(Assay)
+dep_mace <- read_tsv("../results/tableS4_dep_mace.tsv") |>
+  filter(Threshold == "Significant") |> pull(Assay)
+dep_death_all <- read_tsv("../results/tableS5_dep_death_all.tsv") |>
+  filter(Threshold == "Significant") |> pull(Assay)
+dep_all <- unique(c(dep_group, dep_nadm, dep_mace, dep_death_all))
+```
+
+Read differentially expressed genes:
+
+```{r}
+#| message: false
+deg_group <- read_tsv("../results/tableS7_deg_group.tsv") |>
+    filter(padj < 0.05) |> 
+    dplyr::select(gene, external_gene_name) |> 
+    filter(!is.na(external_gene_name))
+deg_nadm <- read_tsv("../results/tableS8_deg_nadm.tsv") |> 
+    filter(padj < 0.05) |> 
+    dplyr::select(gene, external_gene_name) |> 
+    filter(!is.na(external_gene_name))
+deg_mace <- read_tsv("../results/tableS9_deg_mace.tsv") |> 
+    filter(padj < 0.05) |> 
+    dplyr::select(gene, external_gene_name) |> 
+    filter(!is.na(external_gene_name))
+deg_death_all <- read_tsv("../results/tableS10_deg_death_all.tsv") |> 
+    filter(padj < 0.05) |> 
+    dplyr::select(gene, external_gene_name) |> 
+    filter(!is.na(external_gene_name))
+deg_all <- rbind(deg_group, deg_nadm, deg_mace, deg_death_all) |> distinct()
+```
+
+## Helper functions
+
+Both panels of Fig. 3 run the identical protein x gene correlation + heatmap pipeline, differing only in which proteins/genes are included.
+
+```{r}
+compute_cross_omic_correlations <- function(protein_assays, gene_df) {
+  pdata_cors <- pdata |>
+    filter(Assay %in% protein_assays) |>
+    dplyr::select(sid, Assay, NPX) |>
+    pivot_wider(names_from = Assay, values_from = NPX) |>
+    arrange(sid)
+
+  rdata_cors <- read_tsv("../data/rnaseq_transcriptomics_vst.tsv", show_col_types = FALSE) |>
+    filter(gene_ensembl_id %in% gene_df$gene) |>
+    pivot_longer(cols = -gene_ensembl_id, names_to = "sid", values_to = "vst") |>
+    pivot_wider(names_from = gene_ensembl_id, values_from = vst) |>
+    filter(sid %in% pdata_cors$sid) |>
+    arrange(sid)
+
+  pdata_cors <- pdata_cors |> filter(sid %in% rdata_cors$sid)
+
+  pdata_cors <- pdata_cors |> mutate(across(-1, ~ scale(.)[, 1]))
+  rdata_cors <- rdata_cors |> mutate(across(-1, ~ scale(.)[, 1]))
+
+  rdata_cors <- rdata_cors[, -1]
+  pdata_cors <- pdata_cors[, -1]
+
+  pairs <- expand.grid(RNA = names(rdata_cors), Protein = names(pdata_cors), stringsAsFactors = FALSE)
+
+  results <- mapply(function(rna_col, prot_col) {
+    x <- rdata_cors[[rna_col]]
+    y <- pdata_cors[[prot_col]]
+    test <- cor.test(x, y, use = "complete.obs")
+    data.frame(RNA = rna_col, Protein = prot_col, Correlation = test$estimate, P.value = test$p.value)
+  }, pairs$RNA, pairs$Protein, SIMPLIFY = FALSE)
+
+  cor_results_df <- do.call(rbind, results)
+  cor_results_df$adj.p.value <- p.adjust(cor_results_df$P.value, method = "fdr")
+  cor_results_df <- cor_results_df |>
+    mutate(signif = case_when(
+      adj.p.value < 0.001 ~ "**",
+      adj.p.value < 0.01  ~ "*",
+      adj.p.value < 0.05  ~ ".",
+      TRUE ~ ""
+    )) |>
+    left_join(gene_df, by = c("RNA" = "gene"))
+
+  cor_results_df
+}
+
+build_correlation_heatmap <- function(cor_results_df) {
+  mat_df <- cor_results_df |>
+    dplyr::select(external_gene_name, Protein, Correlation) |>
+    pivot_wider(names_from = Protein, values_from = Correlation)
+  mat <- mat_df |> dplyr::select(-1) |> as.matrix()
+  rownames(mat) <- mat_df$external_gene_name
+
+  sig_mat_df <- cor_results_df |>
+    mutate(significant = ifelse(adj.p.value < 0.05, 1, 0)) |>
+    dplyr::select(external_gene_name, Protein, significant) |>
+    pivot_wider(names_from = Protein, values_from = significant)
+  sig_mat <- sig_mat_df |> dplyr::select(-1) |> as.matrix()
+  rownames(sig_mat) <- mat_df$external_gene_name
+
+  Heatmap(
+    mat,
+    name = "Correlation",
+    column_title = "Differentially expressed proteins",
+    row_title = "Differentially expressed genes",
+    column_title_side = "bottom",
+    row_title_side = "right",
+    column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+    row_title_gp = gpar(fontsize = 12, fontface = "bold"),
+    na_col = "grey90",
+    cell_fun = function(j, i, x, y, w, h, fill) {
+      if (sig_mat[i, j]) {
+        grid::grid.rect(x = x, y = y, width = w, height = h,
+                         gp = grid::gpar(col = "black", fill = NA, lwd = 1))
+      }
+    },
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    clustering_method_rows = "complete",
+    clustering_method_columns = "complete",
+    show_row_dend = TRUE,
+    show_column_dend = TRUE,
+    row_dend_width = unit(25, "mm"),
+    column_dend_height = unit(25, "mm"),
+    show_row_names = TRUE,
+    show_column_names = TRUE,
+    row_names_gp = gpar(fontsize = 9),
+    column_names_gp = gpar(fontsize = 9),
+    column_names_rot = 45,
+    rect_gp = gpar(col = "grey85", lwd = 0.6),
+    heatmap_legend_param = list(
+      title = "Spearman\ncorrelation",
+      at = c(-1, -0.5, 0, 0.5, 1),
+      labels = c("-1", "-0.5", "0", "0.5", "1"),
+      legend_height = unit(45, "mm"),
+      title_gp = gpar(fontsize = 10, fontface = "bold"),
+      labels_gp = gpar(fontsize = 9)
+    )
+  )
+}
+```
+
+## Correlations restricted to SNAE-differentially-expressed features (Fig. 3A)
+
+```{r}
+cor_results_snae <- compute_cross_omic_correlations(dep_group, deg_group)
+cor_results_snae |> filter(adj.p.value < 0.05) |> arrange(Correlation)
+```
+
+```{r}
+cor_results_snae |>
+  filter(adj.p.value < 0.05) |>
+  arrange(Correlation) |>
+  dplyr::count(Protein) |>
+  arrange(desc(n))
+```
+
+```{r}
+ht_snae <- build_correlation_heatmap(cor_results_snae)
+# svg("../results/fig3A_correlation_heatmap_snae.svg", width = 10, height = 5)
+draw(ht_snae, heatmap_legend_side = "right", annotation_legend_side = "right",
+     padding = unit(c(4, 4, 4, 4), "mm"))
+# dev.off()
+```
+
+## Correlations across features differentially expressed in any outcome (Fig. 3B)
+
+```{r}
+cor_results_all <- compute_cross_omic_correlations(dep_all, deg_all)
+cor_results_all |> filter(adj.p.value < 0.05) |> arrange(Correlation)
+```
+
+```{r}
+cor_results_all |>
+  filter(adj.p.value < 0.05) |>
+  arrange(Correlation) |>
+  dplyr::count(Protein) |>
+  arrange(desc(n))
+```
+
+```{r}
+ht_all <- build_correlation_heatmap(cor_results_all)
+# svg("../results/fig3B_correlation_heatmap_all.svg", width = 14, height = 9)
+draw(ht_all, heatmap_legend_side = "right", annotation_legend_side = "right",
+     padding = unit(c(4, 4, 4, 4), "mm"))
+# dev.off()
+```
+
+## LGALS9 (Olink NPX) vs. HAVCR2 (TIM-3) PBMC transcript expression (Fig. S10)
+
+```{r}
+#| message: false
+gal9_npx <- pdata |>
+  filter(Assay == "LGALS9") |>
+  dplyr::select(sid, LGALS9 = NPX)
+
+havcr2_vst <- read_tsv("../data/rnaseq_transcriptomics_vst.tsv", show_col_types = FALSE) |>
+  filter(gene_ensembl_id == "ENSG00000135077") |> # HAVCR2 (TIM-3)
+  pivot_longer(-gene_ensembl_id, names_to = "sid", values_to = "HAVCR2_vst") |>
+  dplyr::select(sid, HAVCR2_vst)
+
+gal9_havcr2 <- gal9_npx |> inner_join(havcr2_vst, by = "sid")
+```
+
+```{r}
+ct <- cor.test(gal9_havcr2$LGALS9, gal9_havcr2$HAVCR2_vst, method = "spearman")
+sprintf("LGALS9 vs HAVCR2 (VST): n=%d, Spearman rho=%.3f, p=%.3f",
+        nrow(gal9_havcr2), unname(ct$estimate), ct$p.value)
+```
+
+```{r}
+figS10 <- ggplot(gal9_havcr2, aes(x = LGALS9, y = HAVCR2_vst)) +
+  geom_point(alpha = 0.7, size = 2, color = "#2C3E50") +
+  geom_smooth(method = "lm", se = TRUE, color = "#E74C3C", linewidth = 0.8) +
+  labs(
+    title = "Galectin-9 (LGALS9) vs. HAVCR2 (TIM-3) expression",
+    subtitle = sprintf("Spearman \u03c1 = %.3f, p = %.2f, n = %d", ct$estimate, ct$p.value, nrow(gal9_havcr2)),
+    x = "LGALS9 plasma NPX (Olink)",
+    y = "HAVCR2 PBMC expression (VST)"
+  ) +
+  theme_minimal(base_size = 13)
+
+figS10
+# ggsave("../results/figS10_gal9_havcr2.svg", plot = figS10, width = 6, height = 5)
+```
+
+## Session info
+
+```{r}
+sessioninfo::session_info()
+```

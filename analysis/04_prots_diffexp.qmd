@@ -1,0 +1,175 @@
+---
+title: "4. Differential expression analysis of proteins"
+format:
+  html:
+    df-print: paged
+    embed-resources: true
+    toc: true
+  gfm: default
+---
+
+## Purpose
+
+This script runs differential expression analysis on the Olink proteomics data across the four outcomes (SNAE, malignancy, cardiovascular event, mortality) using `olink_ttest`. It produces the `dep_*.csv` files used by the mixomics and correlation scripts, and generates the FDR-adjusted volcano plots (Fig. 1).
+
+## Reproducibility
+
+This script runs entirely from the public repository. Only `olink_npx_qced_sid.tsv` is needed.
+
+```{r}
+#| message: false
+library(ggpubr)
+library(ggrepel)
+library(OlinkAnalyze)
+library(tidyverse)
+```
+
+## Read data
+
+```{r}
+#| message: false
+pdata <- read_tsv("../data/olink_npx_qced_sid.tsv") |>
+    mutate(
+        group = factor(group, levels = c("Event", "Control")),
+        nadm = factor(nadm, levels = c(1, 0)),
+        mace = factor(mace, levels = c(1, 0)),
+        death_all = factor(death_all, levels = c(1, 0))
+    )
+```
+
+## Shared helpers
+
+Colours/alphas and the differential-expression classification are identical across every outcome. The FDR volcano plot is also shared, but each outcome has small differences from the others (whether the FDR=0.05 reference line is drawn, y-axis expansion, label nudge/force, and whether one assay's label needs a separately-nudged position to avoid overlap). Those are exposed as parameters rather than hardcoded, so each call site states exactly how it differs.
+
+```{r}
+cols   <- c("Up" = "#ffad73", "Down" = "#26b3ff", "n.s." = "grey")
+alphas <- c("Up" = 1, "Down" = 1, "n.s." = 0.5)
+highlight_assays <- c("LGALS9", "DAPP1", "SKAP2", "CCL13")
+
+compute_dep <- function(pdata, outcome_var) {
+    olink_ttest(pdata, outcome_var) |>
+        mutate(prot_exp = case_when(
+            estimate >= 0 & Adjusted_pval <= 0.05 ~ "Up",
+            estimate <= 0 & Adjusted_pval <= 0.05 ~ "Down",
+            TRUE ~ "n.s."
+        ))
+}
+
+plot_volcano_fdr <- function(dep_df, title, xlim_range,
+                             show_hline = TRUE,
+                             y_expand = NULL,
+                             label_nudge_y = 0.05,
+                             label_force = 15,
+                             split_label = NULL) {
+    p <- dep_df |>
+        ggplot(aes(x = estimate, y = -log10(Adjusted_pval), fill = prot_exp, alpha = prot_exp)) +
+        geom_point(shape = 21, colour = "black")
+    
+    if (show_hline) {
+        p <- p + geom_hline(yintercept = -log10(0.05), linetype = "dashed")
+    }
+    if (!is.null(y_expand)) {
+        p <- p + scale_y_continuous(expand = expansion(mult = y_expand))
+    }
+    
+    # Main label layer -- excludes split_label$assay when one assay needs a
+    # separately-nudged position (e.g. SKAP2 in the NADM plot).
+    label_data <- if (!is.null(split_label)) dep_df |> filter(Assay != split_label$assay) else dep_df
+    p <- p +
+        geom_label_repel(
+            data = label_data,
+            aes(label = if_else(Assay %in% highlight_assays, Assay, "")),
+            size = 2, show.legend = FALSE, max.overlaps = Inf,
+            nudge_y = label_nudge_y, min.segment.length = 0,
+            force = label_force, label.padding = unit(0.1, "lines")
+        )
+    
+    if (!is.null(split_label)) {
+        p <- p +
+            geom_label_repel(
+                data = dep_df |> filter(Assay == split_label$assay),
+                aes(label = if_else(Assay %in% highlight_assays, Assay, "")),
+                size = 2, show.legend = FALSE, max.overlaps = Inf,
+                nudge_y = split_label$nudge_y, nudge_x = split_label$nudge_x,
+                min.segment.length = 0, force = 15, label.padding = unit(0.1, "lines")
+            )
+    }
+    
+    p +
+        scale_fill_manual(values = cols, breaks = c("Up", "Down", "n.s."),
+                          labels = c("Up", "Down", "n.s.")) +
+        scale_alpha_manual(values = alphas) +
+        xlim(xlim_range) +
+        theme_bw() +
+        theme(legend.position = "bottom", legend.background = element_rect(colour = "black"),
+              axis.title = element_text(size = 9)) +
+        labs(fill = "Differential abundance", title = title,
+             x = expression(log[2](FC)), y = expression(-log[10]("FDR-adjusted P value"))) +
+        guides(alpha = "none", fill = guide_legend(override.aes = list(alpha = 1)))
+}
+```
+
+## Group
+
+```{r}
+dep_group <- compute_dep(pdata, "group")
+dep_group
+# dep_group |> write_tsv("../results/tableS2_dep_group.tsv")
+```
+
+```{r}
+p1 <- plot_volcano_fdr(dep_group, "PWH with vs without SNAEs", xlim_range = c(-1.1, 1.1),
+                       y_expand = c(0.02, 0.15), label_nudge_y = 0.1, label_force = 1)
+p1
+```
+
+## NADM
+
+```{r}
+dep_nadm <- compute_dep(pdata, "nadm")
+# dep_nadm |> write_tsv("../results/tableS3_dep_nadm.tsv")
+```
+
+```{r}
+p2 <- plot_volcano_fdr(dep_nadm, "PWH with vs without neoplasias", xlim_range = c(-1.7, 1.7),
+                       split_label = list(assay = "SKAP2", nudge_y = 0.08, nudge_x = -0.3))
+p2
+```
+
+## MACE
+
+```{r}
+dep_mace <- compute_dep(pdata, "mace")
+# dep_mace |> write_tsv("../results/tableS4_dep_mace.tsv")
+```
+
+```{r}
+p3 <- plot_volcano_fdr(dep_mace, "PWH with vs without CV events", xlim_range = c(-1.2, 1.2),
+                       show_hline = FALSE)
+p3
+```
+
+## Death_all
+
+```{r}
+dep_death_all <- compute_dep(pdata, "death_all")
+# dep_death_all |> write_tsv("../results/tableS5_dep_death_all.tsv")
+```
+
+```{r}
+p4 <- plot_volcano_fdr(dep_death_all, "PWH with vs without mortality", xlim_range = c(-2.8, 2.8))
+p4
+```
+
+```{r}
+# svg("../results/fig1_AtoD.svg", width = 7, height = 5)
+ggarrange(p1, p2, p3, p4, labels = c("A", "B", "C", "D"),
+          common.legend = TRUE, legend = "bottom")
+# dev.off()
+```
+
+## Session info
+
+```{r}
+sessioninfo::session_info()
+```

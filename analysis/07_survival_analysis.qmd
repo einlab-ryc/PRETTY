@@ -1,0 +1,589 @@
+---
+title: "7. Survival analysis"
+format:
+  html:
+    df-print: paged
+    embed-resources: true
+    toc: true
+  gfm: default
+---
+
+## Purpose
+
+This script fits Cox proportional hazards models for the four ELISA-validated biomarkers across all outcomes. It produces the main models results (Table 2), the outcome-specific tables (Tables S12 to S14), the main Kaplan-Meier figure (Fig. 5) and the outcome-specific KM figures (Figs. S7 to S9). It also produces the non-linearity spline models (Fig. S6), the proportional hazards diagnostics (Fig. S11, Table S16), and the quartile forest plot (Fig. S5).
+
+## Reproducibility
+
+This script runs entirely from the public repository. Only `elisa_validation.tsv` and `metadata.tsv` are needed.
+
+```{r}
+#| message: false
+library(broom)
+library(ggpubr)
+library(ggsurvfit)
+library(gtsummary)
+library(patchwork)
+library(survival)
+library(tidyverse)
+```
+
+## Load public data
+
+`time` (time-to-SNAE-or-censoring) is precomputed and included in `metadata.tsv` directly, so this script is fully reproducible from the public repository. See `01_matching.qmd` / `02_1_preprocess_metadata.qmd` for how the underlying dates were used to derive it (not runnable publicly, documented there for transparency).
+
+```{r}
+#| message: false
+metadata <- read_tsv("../data/metadata.tsv", show_col_types = FALSE) |>
+    mutate(CD4_0_200 = factor(ifelse(CD4_0 < 200, 1, 0)))
+```
+
+# Models
+
+The four ELISA-validated biomarkers (LGALS9, CCL13, DAPP1, SKAP2) go through identical data prep and Cox modelling.
+
+## Helper functions
+
+```{r}
+markers <- c("LGALS9", "CCL13", "DAPP1", "SKAP2")
+outcomes <- c("group", "nadm", "mace", "death_all")
+
+# Builds one marker's analysis dataset: ELISA concentration + metadata +
+# time-to-event, quartile-coded.
+build_marker_data <- function(marker) {
+    read_tsv("../data/elisa_validation.tsv") |>
+        filter(assay == marker) |>
+        left_join(
+            metadata |> dplyr::select(sid, group, nadm, mace, death_all, CD4_0, CD4_0_200, time),
+            by = "sid"
+        ) |>
+        mutate(quantile = factor(ntile(mean_conc, 4))) |>
+        filter(time > 0) |>
+        mutate(group = if_else(group == "Event", 1, 0))
+}
+
+# Categorical quartile Cox model (Q2/Q3/Q4 vs Q1), for one outcome, crude
+# or CD4<200-adjusted.
+fit_categorical_model <- function(data, event_var, adjusted = FALSE) {
+    model_data <- data |>
+        mutate(
+            time, event = as.numeric(as.character(.data[[event_var]])),
+            quantile, CD4_0_200,
+            .keep = "none"
+        ) |>
+        filter(!is.na(time), time > 0, !is.na(event), !adjusted | !is.na(CD4_0_200))
+
+    rhs <- if (adjusted) "quantile + CD4_0_200" else "quantile"
+    coxph(as.formula(paste0("Surv(time, event) ~ ", rhs)), data = model_data)
+}
+
+# Linear-trend Cox model (one HR per one-quartile increase), for one
+# outcome, crude or CD4<200-adjusted. Used for Global P values throughout
+# (Table 2/S12-S14 and the KM figure annotations).
+fit_trend_model <- function(data, event_var, adjusted = FALSE) {
+    model_data <- data |>
+        mutate(
+            time, event = as.numeric(as.character(.data[[event_var]])),
+            q = as.numeric(quantile), CD4_0_200,
+            .keep = "none"
+        ) |>
+        filter(!is.na(time), time > 0, !is.na(event), !adjusted | !is.na(CD4_0_200))
+
+    rhs <- if (adjusted) "q + CD4_0_200" else "q"
+    coxph(as.formula(paste0("Surv(time, event) ~ ", rhs)), data = model_data)
+}
+
+# Event counts per quantile, for each outcome (used to populate Tables).
+count_events_by_quantile <- function(data) {
+    purrr::map(outcomes, function(outcome) {
+        data |> group_by(quantile) |> dplyr::count(.data[[outcome]]) |> filter(.data[[outcome]] == 1)
+    }) |> setNames(outcomes)
+}
+```
+
+## Fit models
+
+```{r}
+marker_data <- purrr::map(markers, build_marker_data) |> setNames(markers)
+```
+
+Categorical (Q2/Q3/Q4 vs Q1) models, crude and CD4<200-adjusted, for every marker and outcome:
+
+```{r}
+categorical_models <- purrr::map(marker_data, function(data) {
+    purrr::map(outcomes, function(outcome) {
+        list(
+            crude = fit_categorical_model(data, outcome, adjusted = FALSE),
+            adjusted = fit_categorical_model(data, outcome, adjusted = TRUE)
+        )
+    }) |> setNames(outcomes)
+})
+```
+
+Linear-trend models, crude and CD4<200-adjusted, for the Global P values:
+
+```{r}
+trend_models <- purrr::map(marker_data, function(data) {
+    purrr::map(outcomes, function(outcome) {
+        list(
+            crude = fit_trend_model(data, outcome, adjusted = FALSE),
+            adjusted = fit_trend_model(data, outcome, adjusted = TRUE)
+        )
+    }) |> setNames(outcomes)
+})
+```
+
+Event counts per marker/outcome/quartile:
+
+```{r}
+marker_event_counts <- purrr::map(marker_data, count_events_by_quantile)
+```
+
+# Tables
+
+## Marker-level summary tables (unadjusted + adjusted, main SNAE comparison)
+
+```{r}
+print_marker_tables <- function(models, marker) {
+    print_one <- function(model) {
+        tidy(model, conf.int = TRUE, exponentiate = TRUE) |> print()
+        model |>
+            tbl_regression(exponentiate = TRUE, label = list(quantile ~ paste(marker, "Quantile"))) |>
+            bold_p(t = 0.05) |>
+            bold_labels() |>
+            print()
+    }
+    print_one(models$group$crude)
+    print_one(models$group$adjusted)
+}
+
+purrr::iwalk(categorical_models, ~ print_marker_tables(.x, .y))
+```
+
+## Crude and adjusted hazard ratios by outcome (Table 2 / Tables S12-S14)
+
+One table per outcome, matching the manuscript's published layout: a Ref.
+row for Q1, per-quartile crude/adjusted HR (95% CI), number of events per
+quartile, and a Global P value row (from the linear-trend models).
+
+```{r}
+format_hr <- function(estimate, low, high) {
+    ifelse(is.na(estimate), NA_character_,
+           ifelse(is.na(low), "Ref.", sprintf("%.2f (%.2f-%.2f)", estimate, low, high)))
+}
+
+build_outcome_table <- function(outcome) {
+    quartile_rows <- purrr::map_dfr(markers, function(marker) {
+        crude <- tidy(categorical_models[[marker]][[outcome]]$crude, exponentiate = TRUE, conf.int = TRUE) |>
+            filter(str_detect(term, "^quantile")) |>
+            mutate(quartile = str_remove(term, "quantile"), crude_estimate = estimate,
+                   crude_low = conf.low, crude_high = conf.high, .keep = "none")
+        adj <- tidy(categorical_models[[marker]][[outcome]]$adjusted, exponentiate = TRUE, conf.int = TRUE) |>
+            filter(str_detect(term, "^quantile")) |>
+            mutate(quartile = str_remove(term, "quantile"), adj_estimate = estimate,
+                   adj_low = conf.low, adj_high = conf.high, .keep = "none")
+        ref <- tibble(quartile = "1", crude_estimate = 1, crude_low = NA, crude_high = NA,
+                      adj_estimate = 1, adj_low = NA, adj_high = NA)
+        n_events <- marker_event_counts[[marker]][[outcome]] |>
+            mutate(quartile = as.character(quantile), n_events = n, .keep = "none")
+
+        bind_rows(ref, crude |> left_join(adj, by = "quartile")) |>
+            left_join(n_events, by = "quartile") |>
+            mutate(
+                biomarker = marker, quartile, n_events,
+                HR = format_hr(crude_estimate, crude_low, crude_high),
+                Adjusted_HR = format_hr(adj_estimate, adj_low, adj_high),
+                .keep = "none"
+            )
+    })
+
+    global_p <- purrr::map_dfr(markers, function(marker) {
+        tibble(
+            biomarker = marker, quartile = "Global P value", n_events = NA_integer_,
+            HR = formatC(tidy(trend_models[[marker]][[outcome]]$crude)$p.value[1], digits = 3, format = "f"),
+            Adjusted_HR = formatC(tidy(trend_models[[marker]][[outcome]]$adjusted)$p.value[1], digits = 3, format = "f")
+        )
+    })
+
+    bind_rows(quartile_rows, global_p) |>
+        mutate(quartile = factor(quartile, levels = c("1", "2", "3", "4", "Global P value"))) |>
+        pivot_wider(
+            id_cols = quartile,
+            names_from = biomarker,
+            values_from = c(n_events, HR, Adjusted_HR),
+            names_glue = "{biomarker}_{.value}"
+        ) |>
+        arrange(quartile) |>
+        dplyr::select(quartile, starts_with("CCL13"), starts_with("DAPP1"),
+                      starts_with("LGALS9"), starts_with("SKAP2"))
+}
+```
+
+```{r}
+table2 <- build_outcome_table("group")
+table2
+# table2 |> write_tsv("../results/table2.tsv")
+```
+
+```{r}
+tableS12 <- build_outcome_table("nadm")
+tableS12
+# tableS12 |> write_tsv("../results/tableS12_neoplasia.tsv")
+```
+
+```{r}
+tableS13 <- build_outcome_table("mace")
+tableS13
+# tableS13 |> write_tsv("../results/tableS13_cardiovascular.tsv")
+```
+
+```{r}
+tableS14 <- build_outcome_table("death_all")
+tableS14
+# tableS14 |> write_tsv("../results/tableS14_mortality.tsv")
+```
+
+## Schoenfeld residuals (Table S16)
+
+```{r}
+model_schoenfeld <- function(fit, transform = "km") {
+    ph <- cox.zph(fit, transform = transform)
+    df <- data.frame(time = ph$x, resid = ph$y[, 1])
+    list(ph = ph, df = df)
+}
+
+schoenfeld_models <- purrr::imap(categorical_models, ~ model_schoenfeld(.x$group$crude))
+
+tableS16 <- purrr::imap_dfr(schoenfeld_models, function(model, marker) {
+    tibble(
+        biomarker = marker,
+        quantile_p = model$ph$table[1, "p"],
+        global_p   = model$ph$table["GLOBAL", "p"]
+    )
+}) |>
+    pivot_longer(cols = c(quantile_p, global_p), names_to = "term", values_to = "p_value") |>
+    mutate(term = recode(term, quantile_p = "quantile (Q1 to Q4)", global_p = "Global")) |>
+    pivot_wider(names_from = biomarker, values_from = p_value) |>
+    select(term, CCL13, DAPP1, LGALS9, SKAP2)
+
+tableS16
+# tableS16 |> write_tsv("../results/tableS16_schoenfeld.tsv")
+```
+
+# Plots
+
+## Kaplan-Meier figures
+
+```{r}
+spread_y <- function(y, min_sep = 0.03, y_min = 0, y_max = 1) {
+    if (length(y) <= 1) return(y)
+
+    ord <- order(y)
+    ys  <- y[ord]
+
+    for (i in 2:length(ys)) {
+        if (ys[i] - ys[i - 1] < min_sep) ys[i] <- ys[i - 1] + min_sep
+    }
+
+    overflow <- max(ys) - y_max
+    if (overflow > 0) {
+        ys <- ys - overflow
+        for (i in (length(ys) - 1):1) {
+            if (ys[i + 1] - ys[i] < min_sep) ys[i] <- ys[i + 1] - min_sep
+        }
+    }
+
+    ys <- pmin(pmax(ys, y_min), y_max)
+
+    out <- y
+    out[ord] <- ys
+    out
+}
+
+plot_cuminc_pub <- function(fit,
+                            title,
+                            xlab = "Months",
+                            ylab = "Time-to-event prob.",
+                            risktable_stats = "cum.event",
+                            x_nudge = 0.6,
+                            min_sep = 0.03,
+                            right_expand = 0.2,
+                            base_size = 10,
+                            p_text = NULL) {
+
+    p <- ggcuminc(fit) +
+        labs(x = xlab, y = ylab, color = "Quartile") +
+        ggtitle(title) +
+        theme_bw(base_size = base_size) +
+        theme(
+            plot.title = element_text(face = "bold", hjust = 0),
+            axis.title = element_text(face = "bold"),
+            legend.position = "none"
+        )
+
+    lab_df <-
+        p$data |>
+        group_by(strata) |>
+        slice_max(time, n = 1, with_ties = FALSE) |>
+        ungroup() |>
+        mutate(
+            strata_chr = as.character(strata),
+            qnum  = str_extract(strata_chr, "\\d+"),
+            label = paste0("Q", qnum),
+            x_label = time + x_nudge
+        )
+
+    lab_df <- lab_df |>
+        mutate(y_label = spread_y(estimate, min_sep = min_sep, y_min = 0, y_max = 1))
+
+    p <- p +
+        geom_text(
+            data = lab_df,
+            aes(x = x_label, y = y_label, label = label, color = strata),
+            inherit.aes = FALSE,
+            fontface = "bold",
+            hjust = 0,
+            size = 3,
+            show.legend = FALSE
+        ) +
+        coord_cartesian(clip = "off") +
+        scale_x_continuous(expand = expansion(mult = c(0.02, right_expand)))
+
+    if (!is.null(p_text)) {
+        p <- p + annotate("text", x = Inf, y = 0.02, label = p_text,
+                          hjust = 1.1, vjust = 0, size = 3.2, fontface = "plain")
+    }
+
+    p <- p + add_risktable(risktable_stats = risktable_stats)
+    ggsurvfit_build(p)
+}
+
+build_4panel_km <- function(p1, p2, p3, p4) {
+    w1 <- wrap_elements(full = p1); w2 <- wrap_elements(full = p2)
+    w3 <- wrap_elements(full = p3); w4 <- wrap_elements(full = p4)
+
+    (w1 | w2) / (w3 | w4) +
+        plot_annotation(tag_levels = "A") &
+        theme(plot.tag = element_text(face = "bold", size = 12),
+              plot.tag.position = c(0.01, 0.99))
+}
+
+p_text_for <- function(marker, outcome_name, adjusted = FALSE) {
+    p <- tidy(trend_models[[marker]][[outcome_name]][[if (adjusted) "adjusted" else "crude"]])$p.value[1]
+    paste0("Global P value = ", formatC(p, digits = 3, format = "f"))
+}
+```
+
+### Main comparison (Fig. 5)
+
+```{r}
+fits_group <- purrr::map(marker_data, ~ survfit2(Surv(time, as.factor(group)) ~ quantile, data = .x))
+
+fig5 <- build_4panel_km(
+    plot_cuminc_pub(fits_group$LGALS9, "LGALS9", p_text = p_text_for("LGALS9", "group")),
+    plot_cuminc_pub(fits_group$CCL13,  "CCL13",  p_text = p_text_for("CCL13", "group")),
+    plot_cuminc_pub(fits_group$DAPP1,  "DAPP1",  p_text = p_text_for("DAPP1", "group")),
+    plot_cuminc_pub(fits_group$SKAP2,  "SKAP2",  p_text = p_text_for("SKAP2", "group"))
+)
+
+# svg("../results/fig5_KM_main.svg", width = 8, height = 8)
+fig5
+# dev.off()
+```
+
+### Outcome-specific comparisons (Figs. S7-S9)
+
+```{r}
+fits_nadm  <- purrr::map(marker_data, ~ survfit2(Surv(time, as.factor(nadm)) ~ quantile, data = .x))
+
+figS7 <- build_4panel_km(
+    plot_cuminc_pub(fits_nadm$LGALS9, "LGALS9", p_text = p_text_for("LGALS9", "nadm")),
+    plot_cuminc_pub(fits_nadm$CCL13,  "CCL13",  p_text = p_text_for("CCL13", "nadm")),
+    plot_cuminc_pub(fits_nadm$DAPP1,  "DAPP1",  p_text = p_text_for("DAPP1", "nadm")),
+    plot_cuminc_pub(fits_nadm$SKAP2,  "SKAP2",  p_text = p_text_for("SKAP2", "nadm"))
+)
+# svg("../results/figS7_KM_nadm.svg", width = 8, height = 8)
+figS7
+# dev.off()
+```
+
+```{r}
+fits_mace  <- purrr::map(marker_data, ~ survfit2(Surv(time, as.factor(mace)) ~ quantile, data = .x))
+
+figS8 <- build_4panel_km(
+    plot_cuminc_pub(fits_mace$LGALS9, "LGALS9", p_text = p_text_for("LGALS9", "mace")),
+    plot_cuminc_pub(fits_mace$CCL13,  "CCL13",  p_text = p_text_for("CCL13", "mace")),
+    plot_cuminc_pub(fits_mace$DAPP1,  "DAPP1",  p_text = p_text_for("DAPP1", "mace")),
+    plot_cuminc_pub(fits_mace$SKAP2,  "SKAP2",  p_text = p_text_for("SKAP2", "mace"))
+)
+# svg("../results/figS8_KM_mace.svg", width = 8, height = 8)
+figS8
+# dev.off()
+```
+
+```{r}
+fits_death <- purrr::map(marker_data, ~ survfit2(Surv(time, as.factor(death_all)) ~ quantile, data = .x))
+
+figS9 <- build_4panel_km(
+    plot_cuminc_pub(fits_death$LGALS9, "LGALS9", p_text = p_text_for("LGALS9", "death_all")),
+    plot_cuminc_pub(fits_death$CCL13,  "CCL13",  p_text = p_text_for("CCL13", "death_all")),
+    plot_cuminc_pub(fits_death$DAPP1,  "DAPP1",  p_text = p_text_for("DAPP1", "death_all")),
+    plot_cuminc_pub(fits_death$SKAP2,  "SKAP2",  p_text = p_text_for("SKAP2", "death_all"))
+)
+# svg("../results/figS9_KM_death.svg", width = 8, height = 8)
+figS9
+# dev.off()
+```
+
+## Non-linearity: penalized spline models (Fig. S6)
+
+```{r}
+fit_spline_plot <- function(data, marker) {
+    data <- data |>
+        mutate(log2_conc = log2(mean_conc)) |>
+        filter(!is.na(log2_conc), !is.na(time), !is.na(group))
+
+    cox_pspline <- coxph(Surv(time, as.numeric(group)) ~ pspline(log2_conc, df = 3), data = data)
+
+    newdat <- data.frame(log2_conc = seq(min(data$log2_conc), max(data$log2_conc), length = 200))
+    pred <- predict(cox_pspline, newdata = newdat, type = "risk", se.fit = TRUE)
+
+    plotdat <- newdat |>
+        mutate(HR = exp(pred$fit), HR_low = exp(pred$fit - 1.96 * pred$se.fit),
+               HR_high = exp(pred$fit + 1.96 * pred$se.fit))
+    q_vals <- quantile(data$log2_conc, probs = c(0.25, 0.50, 0.75), na.rm = TRUE)
+
+    ggplot(plotdat, aes(x = log2_conc, y = HR)) +
+        geom_ribbon(aes(ymin = HR_low, ymax = HR_high), alpha = 0.25) +
+        geom_line(linewidth = 1.2) +
+        geom_vline(xintercept = q_vals, linetype = "dashed", color = "black") +
+        geom_rug(data = data, aes(x = log2_conc), sides = "b", alpha = 0.4, inherit.aes = FALSE) +
+        scale_x_continuous(paste0("log2 ", marker)) +
+        scale_y_continuous("Relative Hazard") +
+        theme_minimal(base_size = 14) +
+        ggtitle(marker)
+}
+
+spline_plots <- purrr::imap(marker_data, fit_spline_plot)
+figS6 <- ggarrange(plotlist = spline_plots[c("LGALS9", "DAPP1", "CCL13", "SKAP2")], labels = "AUTO")
+
+# svg("../results/figS6_non_linearity.svg", width = 7, height = 7)
+figS6
+# dev.off()
+```
+
+## Assessment of proportional hazards assumption (Fig. S11)
+
+```{r}
+plot_schoenfeld_gg <- function(model, xlab = "Time (KM scale)",
+                               ylab = "Scaled Schoenfeld residuals", title = NULL) {
+    pval <- model$ph$table[1, "p"]
+
+    ggplot(model$df, aes(time, resid)) +
+        geom_hline(yintercept = 0, linetype = 2, linewidth = 0.4) +
+        geom_point(alpha = 0.4, size = 1) +
+        geom_smooth(method = "loess", se = TRUE, span = 0.9, linewidth = 0.8) +
+        labs(x = xlab, y = ylab, title = title,
+             subtitle = paste0("Proportional hazards test: p = ", formatC(pval, digits = 3, format = "f"))) +
+        theme_bw(base_size = 12) +
+        theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(size = 10))
+}
+
+schoenfeld_plots <- purrr::imap(schoenfeld_models, ~ plot_schoenfeld_gg(.x, title = .y))
+
+figS11 <- ggarrange(plotlist = schoenfeld_plots[c("LGALS9", "DAPP1", "CCL13", "SKAP2")], labels = "AUTO")
+# svg("../results/figS11_schoenfeld.svg", width = 7, height = 7)
+figS11
+# dev.off()
+```
+
+## Forest plot: hazard ratios by quartile across outcomes (Fig. S5)
+
+```{r}
+forest_data <- purrr::imap_dfr(categorical_models, function(models_by_outcome, marker) {
+    purrr::imap_dfr(
+        list(
+            "Any SNAE" = models_by_outcome$group$crude,
+            "Non-AIDS-defining malignancy" = models_by_outcome$nadm$crude,
+            "Major cardiovascular event" = models_by_outcome$mace$crude,
+            "Mortality" = models_by_outcome$death_all$crude
+        ),
+        function(model, outcome) {
+            tibble(
+                biomarker = marker, outcome = outcome,
+                n = model$n, events = model$nevent,
+                broom::tidy(model, conf.int = TRUE, exponentiate = TRUE)
+            )
+        }
+    )
+}) |>
+    filter(str_detect(term, "^quantile")) |>
+    mutate(
+        quartile = recode(term, "quantile2" = "Q2 vs Q1", "quantile3" = "Q3 vs Q1", "quantile4" = "Q4 vs Q1"),
+        quartile = factor(quartile, levels = c("Q4 vs Q1", "Q3 vs Q1", "Q2 vs Q1")),
+        outcome = factor(outcome, levels = c("Any SNAE", "Non-AIDS-defining malignancy",
+                                             "Major cardiovascular event", "Mortality")),
+        biomarker = factor(biomarker, levels = markers),
+        estimable = is.finite(estimate) & is.finite(conf.low) & is.finite(conf.high) & conf.low > 0
+    )
+
+forest_data |> arrange(biomarker, outcome, quartile)
+```
+
+```{r}
+forest_plot_data <- forest_data |>
+    filter(estimable)
+
+panel_labels <- c(
+    "Any SNAE" = "A   Any SNAE",
+    "Non-AIDS-defining malignancy" = "B   Non-AIDS-defining malignancy",
+    "Major cardiovascular event" = "C   Major cardiovascular event",
+    "Mortality" = "D   Mortality"
+)
+
+forest_plot <- ggplot(
+    forest_plot_data,
+    aes(x = quartile, y = estimate, ymin = conf.low, ymax = conf.high,
+        colour = biomarker, shape = biomarker, group = biomarker)
+) +
+    geom_hline(yintercept = 1, linetype = "dashed", colour = "grey55", linewidth = 0.5) +
+    geom_pointrange(position = position_dodge(width = 0.65), linewidth = 0.55,
+                    key_glyph = ggplot2::draw_key_path) +
+    scale_y_log10() +
+    scale_colour_manual(
+        values = c("LGALS9" = "#F8766D", "CCL13" = "#7CAE00", "DAPP1" = "#00BFC4", "SKAP2" = "#C77CFF"),
+        drop = FALSE
+    ) +
+    scale_shape_manual(
+        values = c("LGALS9" = 16, "CCL13" = 17, "DAPP1" = 15, "SKAP2" = 18),
+        drop = FALSE
+    ) +
+    guides(colour = guide_legend(nrow = 1, byrow = TRUE), shape = "none") +
+    facet_wrap(~ outcome, ncol = 2, labeller = as_labeller(panel_labels)) +
+    coord_flip() +
+    labs(x = NULL, y = "Hazard ratio with 95% confidence interval", colour = NULL, shape = NULL) +
+    theme_bw(base_size = 10) +
+    theme(
+        axis.title = element_text(face = "bold"),
+        axis.text = element_text(colour = "black"),
+        legend.position = "top",
+        legend.justification = "center",
+        legend.direction = "horizontal",
+        legend.box.just = "center",
+        legend.box.background = element_rect(colour = "black", fill = "white", linewidth = 0.5),
+        legend.key.width = grid::unit(1, "cm"),
+        legend.key.height = grid::unit(0.4, "cm"),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold", hjust = 0, size = 11),
+        panel.spacing = grid::unit(1, "lines")
+    )
+
+# svg("../results/figS5_forest_plot.svg", width = 7, height = 7)
+forest_plot
+# dev.off()
+```
+
+## Session info
+
+```{r}
+sessioninfo::session_info()
+```

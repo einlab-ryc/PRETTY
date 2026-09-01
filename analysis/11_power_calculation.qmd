@@ -1,0 +1,125 @@
+---
+title: "11. Statistical power calculation"
+format:
+  html:
+    df-print: paged
+    embed-resources: true
+    toc: true
+  gfm: default
+---
+
+## Purpose
+
+This script reproduces the study's power calculation, the sample size justification reported in the Methods, and the power curve in Fig. S12.
+
+## Reproducibility
+
+This script runs entirely from the public repository. No data files are needed, only the fixed sample sizes and protein counts already stated in the manuscript.
+
+```{r}
+#| message: false
+library(pwr)
+```
+
+```{r}
+d_effect <- 0.7
+```
+
+## Scenario 1: originally available matched population (103 pairs, N=206, 368-protein panel)
+
+```{r}
+n1 <- 103
+k1 <- 368
+alpha1 <- 0.05 / k1
+
+power1 <- pwr.t.test(n = n1, d = d_effect, sig.level = alpha1,
+                      type = "two.sample", alternative = "two.sided")$power
+
+mde1 <- pwr.t.test(n = n1, power = 0.8, sig.level = alpha1,
+                    type = "two.sample", alternative = "two.sided")$d
+
+tibble::tibble(
+  n_per_group = n1, N = 2 * n1, proteins_tested = k1,
+  alpha_bonferroni = alpha1,
+  power_at_d0.7 = power1, power_manuscript = 0.87,
+  mde_at_80pct_power = mde1, mde_manuscript = 0.66
+)
+```
+
+## Scenario 2: final analytic set after QC (69 pairs, 138 participants, 326 proteins)
+
+```{r}
+n2 <- 69
+k2 <- 326
+alpha2 <- 0.05 / k2
+
+power2 <- pwr.t.test(n = n2, d = d_effect, sig.level = alpha2,
+                      type = "two.sample", alternative = "two.sided")$power
+
+mde2 <- pwr.t.test(n = n2, power = 0.8, sig.level = alpha2,
+                    type = "two.sample", alternative = "two.sided")$d
+
+tibble::tibble(
+  n_per_group = n2, N = 2 * n2, proteins_passing_qc = k2,
+  alpha_bonferroni = alpha2,
+  power_at_d0.7 = power2, power_manuscript = 0.59,
+  mde_at_80pct_power = mde2, mde_manuscript = 0.81
+)
+```
+
+## Sanity check against the exact figures quoted in the Methods paragraph
+
+```{r}
+checks <- data.frame(
+  Quantity = c("Power, Scenario 1 (368 proteins)", "MDE @80% power, Scenario 1",
+               "Power, Scenario 2 (326 proteins, post-QC)", "MDE @80% power, Scenario 2"),
+  R        = round(c(power1, mde1, power2, mde2), 2),
+  Methods  = c(0.87, 0.66, 0.59, 0.81)
+)
+checks$Match <- ifelse(abs(checks$R - checks$Methods) < 0.005, "OK", "MISMATCH")
+checks
+```
+
+## Fig. S12: power vs. total sample size
+
+d=0.7, alpha=0.05/326 (post-QC threshold, the one carried into the manuscript figure), balanced groups (n1 = n2).
+
+```{r}
+n_seq <- seq(40, 220, by = 20)
+curve_power <- sapply(n_seq / 2, function(n_per_group) {
+  pwr.t.test(n = n_per_group, d = d_effect, sig.level = alpha2,
+             type = "two.sample", alternative = "two.sided")$power
+})
+curve_df <- data.frame(N_total = n_seq, N_per_group = n_seq / 2,
+                        Power = round(curve_power, 4))
+curve_df
+```
+
+```{r}
+plot_power_curve <- function() {
+  par(cex.axis = 1.3, cex.lab = 1.5, mar = c(6, 5.5, 5, 1.5))
+  plot(curve_df$N_total, curve_df$Power, type = "b", pch = 19, cex = 1.3, lwd = 2, col = "#1a3a5c",
+       xlab = "Total sample size (N, balanced n1 = n2)", ylab = "Power",
+       sub = sprintf("Standardized between-group difference d = %.1f; alpha = 0.05/%d (Bonferroni)",
+                      d_effect, k2),
+       ylim = c(0, 1), cex.main = 1.7, cex.sub = 1.15)
+  abline(h = 0.8, lty = 2, lwd = 1.5, col = "grey50")
+  points(2 * n2, power2, pch = 17, col = "#c0392b", cex = 1.9)
+  text(2 * n2, power2, labels = sprintf("  final set\n  N=%d, power=%.0f%%", 2 * n2, 100 * power2),
+       pos = 4, cex = 1.15, col = "#c0392b")
+  legend("bottomright", legend = "80% power threshold", lty = 2, lwd = 1.5, col = "grey50",
+         bty = "n", cex = 1.15)
+}
+
+plot_power_curve()
+
+# pdf("../results/FigS12_power_calculation.pdf", width = 10.5, height = 7)
+plot_power_curve()
+# dev.off()
+```
+
+## Session info
+
+```{r}
+sessioninfo::session_info()
+```

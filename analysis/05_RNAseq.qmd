@@ -1,0 +1,461 @@
+---
+title: "5. RNA-seq analysis"
+format:
+  html:
+    df-print: paged
+    embed-resources: true
+    toc: true
+  gfm: default
+---
+
+## Purpose
+
+This script runs differential expression analysis on the RNA-seq data across the four outcomes using DESeq2, producing the `deg_*.tsv` files (Table S7 to S10) and the FDR-adjusted volcano plots (Fig. 2). It also runs the cell-type deconvolution statistical analysis (Wilcoxon tests per cell type, BH-corrected within each outcome), reproducing Table S11 and Fig. S2.
+
+## Reproducibility
+
+This script runs entirely from the public repository. Only `rnaseq_transcriptomics_counts.tsv`, `metadata.tsv`, and `cell_deconvolution_sid.csv` are needed.
+
+```{r}
+#| message: false
+library(AnnotationDbi)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(DESeq2)
+library(ggpubr)
+library(ggrepel)
+library(pheatmap)
+library(RColorBrewer)
+library(tidyverse)
+```
+
+## Data generation
+
+RNA-seq reads were processed with nf-core/rnaseq v3.17.0, using STAR/RSEM for alignment and quantification, against the GRCh38.112 Ensembl reference. `rnaseq_transcriptomics_counts.tsv` is derived from the pipeline's `rsem.merged.gene_counts.tsv` output.
+
+```{bash}
+#| eval: false
+nextflow run \
+    nf-core/rnaseq -r 3.17.0 \
+    --input "samplesheet.csv" \
+    --outdir "results" \
+    --gtf "Homo_sapiens.GRCh38.112.gtf.gz" \
+    --fasta "Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa.gz" \
+    --aligner "star_rsem" \
+    --igenomes_ignore \
+    --genome null \
+    -profile singularity \
+    -c nextflow.config
+```
+
+Reference files (`Homo_sapiens.GRCh38.112.gtf.gz`, `Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa.gz`) are the standard Ensembl release 112 GRCh38 assembly, publicly available from Ensembl.
+
+## Load public data and build the dds object
+
+Raw RNA-seq counts (genes x samples) and the public metadata file are combined here to build the `DESeqDataSet` from scratch.
+
+```{r}
+#| message: false
+counts_mat <- read_tsv("../data/rnaseq_transcriptomics_counts.tsv") |>
+    column_to_rownames("gene_ensembl_id") |>
+    as.matrix()
+```
+
+```{r}
+#| message: false
+coldata <- read_tsv("../data/metadata.tsv") |>
+    filter(sid %in% colnames(counts_mat)) |>
+    column_to_rownames("sid")
+
+coldata <- coldata[colnames(counts_mat), , drop = FALSE] # match sample order
+```
+
+```{r}
+stopifnot(all(colnames(counts_mat) == rownames(coldata))) # Must be TRUE
+```
+
+```{r}
+dds <- DESeqDataSetFromMatrix(
+    countData = round(counts_mat),
+    colData   = coldata,
+    design    = ~1
+)
+```
+
+## dds inspection
+
+```{r}
+head(counts(dds)) # to check the raw counts
+```
+
+```{r}
+colData(dds) # to check the sample info
+```
+
+```{r}
+design(dds) # to check the design formula
+```
+
+## Pre-filtering
+
+```{r}
+smallestGroupSize <- 3
+
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds_filtered <- dds[keep, ]
+```
+
+## Help functions
+
+```{r}
+# A function to run DESeq2
+run_deseq <- function(dds, design_var) {
+    dds_tmp <- DESeqDataSet(dds, design = as.formula(paste0("~ ", design_var)))
+    dds_tmp <- DESeq(dds_tmp)
+    res <- results(dds_tmp)
+    list(dds = dds_tmp, res = res)
+}
+```
+
+```{r}
+# A function for Ensembl annotation
+annotate_genes <- function(ensembl_ids) {
+    mart <- useEnsembl("genes", "hsapiens_gene_ensembl")
+    
+    getBM(
+        attributes = c(
+            "ensembl_gene_id",
+            "external_gene_name",
+            "description",
+            "gene_biotype"
+        ),
+        filters = "ensembl_gene_id",
+        values = unique(ensembl_ids),
+        mart = mart
+    )
+}
+```
+
+```{r}
+tidy_results <- function(res, lfc = 0, alpha = 0.05, filter_sig = TRUE) {
+    
+    # 1. Convert DESeq2 results to tibble and classify genes
+    res_tb <- as_tibble(res) |>
+        mutate(
+            gene = rownames(res),
+            diffexpressed = case_when(
+                log2FoldChange >  lfc & padj < alpha ~ "upregulated",
+                log2FoldChange < -lfc & padj < alpha ~ "downregulated",
+                TRUE ~ "not_de"
+            )
+        ) |>
+        relocate(gene)
+    
+    # 2. Annotate ALL genes
+    annot <- annotate_genes(res_tb$gene) |>
+        mutate(
+            description = sub("\\s*\\[.*\\]$", "", description)
+        )
+    
+    # 3. Join annotation
+    res_tb <- res_tb |>
+        left_join(
+            annot,
+            by = c("gene" = "ensembl_gene_id")
+        ) |>
+        arrange(pvalue)
+    
+    # 4. Optionally filter significant genes
+    if (filter_sig) {
+        res_tb <- res_tb |> filter(padj < alpha)
+    }
+    
+    return(res_tb)
+}
+```
+
+```{r}
+# FDR-adjusted volcano plot
+plot_volcano_fdr <- function(
+        res_tb,
+        title,
+        lfc_cutoff = 1,
+        fdr_cutoff = 0.05,
+        label_pc_only = TRUE
+) {
+    cols <- c("upregulated" = "#ffad73", "downregulated" = "#26b3ff", "not_de" = "grey")
+    alphas <- c("upregulated" = 1, "downregulated" = 1, "not_de" = 0.5)
+    
+    plot_tb <- res_tb |>
+        mutate(
+            genelabels = ifelse(
+                diffexpressed != "not_de" &
+                    (!label_pc_only | gene_biotype == "protein_coding"),
+                external_gene_name,
+                ""
+            )
+        )
+    xmax <- max(abs(plot_tb$log2FoldChange), na.rm = TRUE)
+    
+    ggplot(
+        plot_tb,
+        aes(x = log2FoldChange, y = -log10(padj), fill = diffexpressed, alpha = diffexpressed)
+    ) +
+        geom_point(shape = 21, colour = "black") +
+        geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), linetype = "dashed",
+                   linewidth = 0.2, colour = "black") +
+        geom_hline(yintercept = -log10(fdr_cutoff), linetype = "dashed") +
+        scale_fill_manual(values = cols, name = "Differential expression",
+                          breaks = c("upregulated", "downregulated", "not_de"),
+                          labels = c("Up", "Down", "n.s.")) +
+        scale_alpha_manual(values = alphas) +
+        scale_x_continuous(limits = c(-xmax, xmax)) +
+        theme_bw() +
+        theme(legend.position = "bottom",
+              legend.background = element_rect(colour = "black", linewidth = 0.5),
+              axis.title = element_text(size = 9)) +
+        labs(title = title, x = expression(log[2](FC)),
+             y = expression(-log[10]("FDR-adjusted P value"))) +
+        guides(alpha = "none")
+}
+```
+
+## Run analyses
+
+```{r}
+res_group      <- run_deseq(dds_filtered, "group")
+res_nadm       <- run_deseq(dds_filtered, "nadm")
+res_mace       <- run_deseq(dds_filtered, "mace")
+res_death_all  <- run_deseq(dds_filtered, "death_all")
+```
+
+## Tidy + plot
+
+```{r}
+tb_group <- tidy_results(res_group$res, filter_sig = FALSE)
+tb_group
+tb_nadm  <- tidy_results(res_nadm$res, filter_sig = FALSE)
+tb_nadm
+tb_mace  <- tidy_results(res_mace$res, filter_sig = FALSE)
+tb_mace
+tb_death <- tidy_results(res_death_all$res, filter_sig = FALSE)
+tb_death
+```
+
+## Export results
+
+```{r}
+# tb_group |> write_tsv("../results/tableS7_deg_group.tsv")
+# tb_nadm |> write_tsv("../results/tableS8_deg_nadm.tsv")
+# tb_mace |> write_tsv("../results/tableS9_deg_mace.tsv")
+# tb_death |> write_tsv("../results/tableS10_deg_death_all.tsv")
+```
+
+## Volcano plots
+
+```{r}
+pA <- plot_volcano_fdr(tb_group, "PWH with vs without SNAEs")
+pA
+pB <- plot_volcano_fdr(tb_nadm, "PWH with vs without neoplasias")
+pB
+pC <- plot_volcano_fdr(tb_mace, "PWH with vs without CV events")
+pC
+pD <- plot_volcano_fdr(tb_death, "PWH with vs without mortality")
+pD
+```
+
+All together in one figure:
+
+```{r}
+# svg("../results/fig2_AtoD.svg", width = 7, height = 5)
+ggarrange(pA, pB, pC, pD, labels = c("A", "B", "C", "D"),
+          common.legend = TRUE, legend = "bottom")
+# dev.off()
+```
+
+## Cell deconvolution statistical analysis
+
+This section reproduces the statistics reported in Table S11/Fig. S2 directly from the public deconvolution results file.
+
+```{r}
+#| message: false
+deconv <- read_csv("../data/cell_deconvolution_sid.csv")
+metadata <- read_tsv("../data/metadata.tsv")
+
+outcomes <- c("group", "nadm", "mace", "death_all")
+diagnostic_columns <- c("sid", "P-value", "Correlation", "RMSE")
+cell_types <- setdiff(names(deconv), diagnostic_columns)
+```
+
+```{r}
+fit_qc <- deconv |>
+    summarise(
+        samples = n(),
+        cibersort_p_lt_0.001 = sum(`P-value` < 0.001),
+        correlation_median = median(Correlation),
+        correlation_q1 = quantile(Correlation, 0.25),
+        correlation_q3 = quantile(Correlation, 0.75),
+        rmse_median = median(RMSE),
+        rmse_q1 = quantile(RMSE, 0.25),
+        rmse_q3 = quantile(RMSE, 0.75)
+    )
+fit_qc
+```
+
+```{r}
+celltype_qc <- deconv |>
+    dplyr::select(all_of(cell_types)) |>
+    pivot_longer(everything(), names_to = "cell_type", values_to = "cell_proportion") |>
+    group_by(cell_type) |>
+    summarise(
+        mean_proportion = mean(cell_proportion),
+        median_proportion = median(cell_proportion),
+        q1_proportion = quantile(cell_proportion, 0.25),
+        q3_proportion = quantile(cell_proportion, 0.75),
+        nonzero_n = sum(cell_proportion > 0),
+        zero_n = sum(cell_proportion == 0),
+        zero_percent = 100 * mean(cell_proportion == 0),
+        .groups = "drop"
+    ) |>
+    arrange(desc(mean_proportion))
+celltype_qc
+```
+
+```{r}
+# group/nadm/mace/death_all: convert group's "Control"/"Event" labels to
+# 0/1 first, so all four outcomes share the same 0/1 convention.
+metadata_rnaseq <- metadata |>
+    filter(sid %in% deconv$sid) |>
+    mutate(group = if_else(group == "Event", 1, 0)) |>
+    mutate(across(all_of(outcomes), as.integer))
+
+analysis_data <- deconv |>
+    left_join(metadata_rnaseq, by = "sid")
+```
+
+```{r}
+sample_counts <- analysis_data |>
+    dplyr::select(sid, all_of(outcomes)) |>
+    pivot_longer(cols = all_of(outcomes), names_to = "outcome", values_to = "event") |>
+    filter(!is.na(event)) |>
+    dplyr::count(outcome, event, name = "n")
+sample_counts
+```
+
+```{r}
+deconv_long <- analysis_data |>
+    dplyr::select(sid, all_of(cell_types), all_of(outcomes)) |>
+    pivot_longer(cols = all_of(cell_types), names_to = "cell_type", values_to = "cell_proportion") |>
+    pivot_longer(cols = all_of(outcomes), names_to = "outcome", values_to = "event") |>
+    filter(!is.na(event))
+
+compare_groups <- function(data) {
+    event0 <- data$cell_proportion[data$event == 0]
+    event1 <- data$cell_proportion[data$event == 1]
+    
+    test <- suppressWarnings(wilcox.test(event1, event0, paired = FALSE, exact = FALSE, correct = TRUE))
+    
+    combined_ranks <- rank(c(event1, event0), ties.method = "average")
+    n1 <- length(event1); n0 <- length(event0)
+    mann_whitney_u <- sum(combined_ranks[seq_len(n1)]) - n1 * (n1 + 1) / 2
+    rank_biserial <- (2 * mann_whitney_u / (n1 * n0)) - 1
+    
+    tibble(
+        n_event0 = n0, n_event1 = n1,
+        median_event0 = median(event0), q1_event0 = quantile(event0, 0.25, names = FALSE),
+        q3_event0 = quantile(event0, 0.75, names = FALSE),
+        median_event1 = median(event1), q1_event1 = quantile(event1, 0.25, names = FALSE),
+        q3_event1 = quantile(event1, 0.75, names = FALSE),
+        median_difference = median(event1) - median(event0),
+        rank_biserial = rank_biserial, p_value = test$p.value
+    )
+}
+
+celltype_results <- deconv_long |>
+    group_by(outcome, cell_type) |>
+    group_modify(~ compare_groups(.x)) |>
+    ungroup() |>
+    group_by(outcome) |>
+    mutate(p_adj = p.adjust(p_value, method = "BH")) |>
+    ungroup() |>
+    arrange(outcome, p_adj, p_value)
+celltype_results
+```
+
+```{r}
+nominal_findings <- celltype_results |> filter(p_value < 0.05)
+fdr_findings <- celltype_results |> filter(p_adj < 0.05)
+nominal_findings
+fdr_findings
+```
+
+```{r}
+# celltype_results |> write_tsv("../results/tableS11_cell_deconvolution_results.tsv")
+```
+
+## Deconvolution figure (Fig. S2)
+
+```{r}
+group_plot_data <- deconv_long |>
+    filter(outcome == "group") |>
+    mutate(
+        event = factor(event, levels = c(0, 1), labels = c("No event", "Event")),
+        cell_type = as.character(cell_type)
+    )
+
+cell_order <- group_plot_data |>
+    group_by(cell_type) |>
+    summarise(mean_abundance = mean(cell_proportion), .groups = "drop") |>
+    arrange(desc(mean_abundance)) |>
+    pull(cell_type)
+
+group_plot_data <- group_plot_data |>
+    mutate(cell_type = factor(cell_type, levels = cell_order))
+
+label_positions <- group_plot_data |>
+    mutate(cell_type = as.character(cell_type)) |>
+    group_by(cell_type) |>
+    summarise(y_position = max(cell_proportion) * 1.12 + 0.002, .groups = "drop")
+
+nominal_labels <- celltype_results |>
+    filter(outcome == "group", p_value < 0.05) |>
+    dplyr::select(cell_type, p_value) |>
+    mutate(cell_type = as.character(cell_type)) |>
+    left_join(label_positions, by = "cell_type") |>
+    mutate(
+        cell_type = factor(cell_type, levels = cell_order),
+        p_label = format.pval(p_value, digits = 1, eps = 0.001)
+    )
+
+deconvolution_figure <- ggplot(group_plot_data, aes(x = cell_type, y = cell_proportion, fill = event)) +
+    geom_boxplot(position = position_dodge2(width = 0.8, preserve = "single"),
+                 width = 0.68, outlier.size = 0.7, outlier.alpha = 0.5, linewidth = 0.35) +
+    geom_text(data = nominal_labels, aes(x = cell_type, y = y_position, label = p_label),
+              inherit.aes = FALSE, size = 3.2, fontface = "bold") +
+    scale_fill_manual(values = c("No event" = "#0072B2", "Event" = "#D55E00")) +
+    scale_y_sqrt(labels = scales::label_percent(accuracy = 1),
+                 expand = expansion(mult = c(0.02, 0.14))) +
+    labs(x = NULL, y = "Estimated cell proportion", fill = NULL) +
+    theme_bw(base_size = 10) +
+    theme(
+        legend.position = "top",
+        legend.background = element_rect(colour = "black", fill = "white", linewidth = 0.4),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(angle = 55, hjust = 1, vjust = 1, size = 8),
+        axis.title.y = element_text(margin = margin(r = 8)),
+        plot.caption = element_text(hjust = 0, size = 8)
+    )
+
+deconvolution_figure
+
+# svg("../results/figS2_cell_deconvolution.svg", width = 7, height = 7)
+deconvolution_figure
+# dev.off()
+```
+
+## Session info
+
+```{r}
+sessioninfo::session_info()
+```

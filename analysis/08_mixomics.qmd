@@ -1,0 +1,266 @@
+---
+title: "8. Multiomics integration (DIABLO)"
+format:
+  html:
+    df-print: paged
+    embed-resources: true
+    toc: true
+  gfm: default
+---
+
+## Purpose
+
+This script runs the DIABLO multi-omic integration analysis on the proteomics and transcriptomics data. It produces the four panels of Fig. S3, the sample plot, the top loadings, the circos plot, and the correlation heatmap restricted to the selected features.
+
+## Reproducibility
+
+This script runs entirely from the public repository, using `olink_npx_qced_sid.tsv`, `rnaseq_transcriptomics_vst.tsv`, and `dep_group.tsv`. The component and variable selection tuning steps are slow and are included as `eval: false`, with the resulting values hardcoded in the final model. Gene symbol annotation queries Ensembl through biomaRt at render time, so an internet connection is required.
+
+```{r}
+#| message: false
+library(biomaRt)
+library(ComplexHeatmap)
+library(circlize)
+library(DESeq2)
+library(ggpubr)
+library(grid)
+library(mixOmics)
+library(tidyverse)
+```
+
+## Load data
+
+Both public files are already keyed by `sid` directly, so no private ID crosswalk is needed.
+
+```{r}
+#| message: false
+pdata <- read_tsv("../data/olink_npx_qced_sid.tsv")
+mdata <- pdata |>
+    dplyr::select(sid:death_all) |>
+    distinct() |>
+    arrange(sid)
+```
+
+```{r}
+#| message: false
+rna_mat <- read_tsv("../data/rnaseq_transcriptomics_vst.tsv") |>
+    column_to_rownames("gene_ensembl_id") |>
+    as.matrix()
+```
+
+```{r}
+# Remove near-constant genes, keep top 5000 most variable
+vars <- apply(rna_mat, 1, var)
+rna_mat <- rna_mat[order(vars, decreasing = TRUE)[1:5000], ]
+# DIABLO expects centered/scaled blocks, samples as rows
+rna_mat <- scale(t(rna_mat))
+```
+
+## Create input for DIABLO
+
+```{r}
+pdata_mat <- pdata |>
+    dplyr::select(sid, Assay, NPX) |>
+    pivot_wider(names_from = Assay, values_from = NPX) |>
+    arrange(sid)
+
+full_samples <- intersect(pdata_mat$sid, rownames(rna_mat))
+
+protein_mat <- as.matrix(pdata_mat[, -1])
+rownames(protein_mat) <- pdata_mat$sid
+protein_mat <- protein_mat[full_samples, ]
+rna_mat <- rna_mat[full_samples, ]
+
+X <- list(protein = scale(protein_mat), mRNA = rna_mat)
+
+Y_group <- factor(mdata |> filter(sid %in% full_samples) |> pull(group), labels = c("No", "Yes"))
+names(Y_group) <- mdata |> filter(sid %in% full_samples) |> pull(sid)
+summary(Y_group)
+```
+
+## DIABLO
+
+### Design matrix
+
+```{r}
+design <- matrix(c(0, 0.1,
+                   0.1, 0), ncol = 2)
+```
+
+### Number of components
+
+```{r}
+#| eval: false
+diablo_screen <- block.plsda(X, Y_group, ncomp = 5, design = design)
+perf.diablo.pretty <- perf(diablo_screen,
+                           validation = 'Mfold',
+                           folds = 10,
+                           nrepeat = 10,
+                           BPPARAM = BiocParallel::MulticoreParam(workers = 5))
+plot(perf.diablo.pretty)
+perf.diablo.pretty$choice.ncomp$WeightedVote
+```
+
+```{r}
+# Result of the tuning above
+ncomp <- 2
+```
+
+### Number of variables to select
+
+Slow (grid search with repeated cross-validation) -- not run by default. The manuscript's Methods state 25 variables per block on 2 components, matching the hardcoded values used below.
+
+```{r}
+#| eval: false
+test.keepX <- list(mRNA = c(5:9, seq(10, 25, 5)),
+                   protein = c(5:9, seq(10, 25, 5)))
+tune.diablo.pretty <- tune.block.splsda(X, Y_group, ncomp = 2,
+                                        test.keepX = test.keepX, design = design,
+                                        validation = 'Mfold', folds = 10, nrepeat = 100,
+                                        dist = "max.dist",
+                                        BPPARAM = BiocParallel::MulticoreParam(workers = 8))
+tune.diablo.pretty$choice.keepX
+```
+
+```{r}
+# Result of the tuning above -- matches the Methods (25 variables/block, 2 components)
+list.keepX <- list(protein = c(25, 25), mRNA = c(25, 25))
+```
+
+### Final model
+
+```{r}
+diablo.pretty <- block.splsda(X, Y_group, ncomp = ncomp,
+                              keepX = list.keepX, design = design)
+```
+
+## Sample plot (Fig. S3A)
+
+```{r}
+plotDiablo(diablo.pretty, ncomp = 1)
+```
+
+```{r}
+# svg("../results/figS3a_diablo_sample_plot.svg", width = 7, height = 7)
+plotIndiv(diablo.pretty, ind.names = FALSE, legend = TRUE, ellipse = TRUE,
+          title = '', legend.title = "SNAEs")
+# dev.off()
+```
+
+## Top 25 contributing variables per block (Fig. S3B)
+
+```{r}
+comp1_vars <- selectVar(diablo.pretty, comp = 1)
+comp1_vars
+```
+
+Gene-symbol labels (the mRNA block is Ensembl-ID-keyed by default, but the manuscript names contributors by symbol):
+
+```{r}
+#| message: false
+mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", version = 112)
+
+gene_map <- getBM(
+    attributes = c("ensembl_gene_id", "hgnc_symbol"),
+    filters = "ensembl_gene_id",
+    values = comp1_vars$mRNA$name,
+    mart = mart
+) |>
+    distinct(ensembl_gene_id, .keep_all = TRUE)
+
+# A few IDs have no current HGNC symbol; assigned manually for figure legibility
+manual_symbols <- c(
+    "ENSG00000254802" = "lnc-ASPH-5",
+    "ENSG00000261790" = "lnc-NOXO1-1",
+    "ENSG00000285535" = "lnc-unnamed"
+)
+
+gene_map <- gene_map |>
+    mutate(hgnc_symbol = if_else(ensembl_gene_id %in% names(manual_symbols),
+                                 unname(manual_symbols[ensembl_gene_id]), hgnc_symbol))
+
+mrna_ids <- colnames(X$mRNA)
+mrna_ids_clean <- sub("\\.[0-9]+$", "", mrna_ids)
+matched_symbols <- gene_map$hgnc_symbol[match(mrna_ids_clean, gene_map$ensembl_gene_id)]
+mrna_labels <- ifelse(!is.na(matched_symbols) & matched_symbols != "", matched_symbols, mrna_ids)
+
+variable_labels <- list(protein = colnames(X$protein), mRNA = mrna_labels)
+
+stopifnot(
+    length(variable_labels$protein) == ncol(X$protein),
+    length(variable_labels$mRNA) == ncol(X$mRNA)
+)
+```
+
+```{r}
+# svg("../results/figS3b_diablo_loadings.svg", width = 8, height = 5)
+plotLoadings(
+    diablo.pretty, comp = 1, contrib = "max", method = "median",
+    name.var = variable_labels, legend.title = "SNAEs",
+    title = "Top 25 contributing variables"
+)
+# dev.off()
+```
+
+## Circos plot (Fig. S3C)
+
+```{r}
+# svg("../results/figS3c_diablo_circos.svg", width = 7, height = 7)
+corr.pretty <- circosPlot(diablo.pretty, cutoff = 0.6, line = TRUE,
+                          color.blocks = c('darkorchid', 'brown1'),
+                          color.cor = c("chocolate3", "grey20"), size.labels = 1.5,
+                          size.variables = 0.8, comp = 1,
+                          legend.title = "SNAEs",
+                          var.names = variable_labels)
+# dev.off()
+```
+
+## Pairwise correlations among the 25 selected features per block (Fig. S3D)
+
+```{r}
+#| message: false
+deg_group <- read_tsv("../results/tableS7_deg_group.tsv") |> 
+    filter(padj < 0.05)
+dep_group <- read_tsv("../results/tableS2_dep_group.tsv") |>
+    filter(Threshold == "Significant")
+```
+
+```{r}
+display_lookup <- c(
+    setNames(variable_labels$protein, colnames(X$protein)),
+    setNames(variable_labels$mRNA, colnames(X$mRNA))
+)
+
+mat <- corr.pretty[1:25, 26:50]
+
+rn_original <- rownames(mat)
+cn_original <- colnames(mat)
+
+bold_rows <- rn_original %in% dep_group$Assay
+bold_columns <- sub("\\.[0-9]+$", "", cn_original) %in% sub("\\.[0-9]+$", "", deg_group$gene)
+
+new_rn <- unname(display_lookup[rn_original])
+new_cn <- unname(display_lookup[cn_original])
+new_rn[is.na(new_rn) | new_rn == ""] <- rn_original[is.na(new_rn) | new_rn == ""]
+new_cn[is.na(new_cn) | new_cn == ""] <- cn_original[is.na(new_cn) | new_cn == ""]
+
+rownames(mat) <- new_rn
+colnames(mat) <- new_cn
+
+diablo_selected_heatmap <- Heatmap(
+    mat,
+    name = "Pearson\ncorrelation",
+    row_names_gp = gpar(fontface = ifelse(bold_rows, "bold", "plain")),
+    column_names_gp = gpar(fontface = ifelse(bold_columns, "bold", "plain"))
+)
+
+# svg("../results/figS3d_diablo_selected_heatmap.svg", width = 7, height = 7)
+draw(diablo_selected_heatmap)
+# dev.off()
+```
+
+## Session info
+
+```{r}
+sessioninfo::session_info()
+```
